@@ -1,6 +1,6 @@
 # Switching Mixer for Disting NT
 
-A CV/MIDI-controlled crossfade/switching mixer algorithm for the Expert Sleepers Disting NT.
+A CV/MIDI-controlled and i2c-mappable switching mixer algorithm for the Expert Sleepers Disting NT.
 
 ## Overview
 
@@ -120,7 +120,7 @@ arm-none-eabi-g++ -shared -o SwMx.ntplugin SwitchingMixer.o
 
 ## Author
 
-Custom plugin / Code by AI
+Me!
 
 ## License
 
