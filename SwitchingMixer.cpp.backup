@@ -1,0 +1,572 @@
+/*
+ * Switching Mixer (SwMx)
+ * Author: Custom / Code by AI
+ *
+ * Many mono/stereo groups in, each group with 2 inputs (A/B),
+ * crossfade/switch control, and up to 4 mono/stereo destinations out.
+ */
+
+#include <distingnt/api.h>
+#include <new>
+#include <cmath>
+#include <algorithm>
+
+// --- Specification indices ---
+enum SpecIndex {
+    SPEC_GROUPS = 0,
+    NUM_SPECS
+};
+
+// --- Hardware limits ---
+constexpr int MAX_GROUPS = 4;
+constexpr int MAX_DESTINATIONS = 4;
+constexpr int MAX_BUSSES = 28;
+
+// --- Control types ---
+enum ControlType {
+    CTRL_UNIPOLAR = 0,
+    CTRL_BIPOLAR,
+    CTRL_UNI_REV,
+    CTRL_BI_REV,
+    CTRL_TRIGGER,
+    CTRL_TRIG_REV,
+    CTRL_GATE,
+    CTRL_GATE_REV,
+    CTRL_TYPE_COUNT
+};
+
+static const char* const controlTypeStrings[] = {
+    "Unipolar", "Bipolar", "Uni Rev", "Bi Rev",
+    "Trigger", "Trig Rev", "Gate", "Gate Rev", nullptr
+};
+
+// --- Crossfade curves ---
+enum CrossfadeCurve {
+    CURVE_LINEAR = 0,
+    CURVE_EQUAL_POWER,
+    CURVE_S_CURVE,
+    CURVE_COUNT
+};
+
+static const char* const curveStrings[] = {
+    "Linear", "Equal Power", "S-Curve", nullptr
+};
+
+// --- Constants ---
+constexpr float TRIGGER_THRESHOLD = 2.5f;
+constexpr float GATE_THRESHOLD = 2.5f;
+
+// --- Parameter indices per group ---
+enum GroupParamOffset {
+    GP_INPUT_A_L = 0,
+    GP_INPUT_A_R,
+    GP_INPUT_B_L,
+    GP_INPUT_B_R,
+    GP_CONTROL,
+    GP_VOLUME_A,
+    GP_VOLUME_B,
+    GP_CTRL_TYPE,
+    GP_CURVE,
+    GP_SLEW,
+    GP_MIDI_ENABLE,
+    GP_MIDI_CHANNEL,
+    GP_MIDI_CC,
+    GP_DEST_COUNT,
+    GP_DEST1_L,
+    GP_DEST1_R,
+    GP_DEST2_L,
+    GP_DEST2_R,
+    GP_DEST3_L,
+    GP_DEST3_R,
+    GP_DEST4_L,
+    GP_DEST4_R,
+    PARAMS_PER_GROUP
+};
+
+// Global params
+enum GlobalParam {
+    PARAM_BYPASS = 0,
+    PARAM_GLOBAL_SLEW,
+    GLOBAL_PARAM_COUNT
+};
+
+constexpr size_t MAX_PARAMS = GLOBAL_PARAM_COUNT + (MAX_GROUPS * PARAMS_PER_GROUP);
+
+// --- Per-group runtime state ---
+struct MixerGroupState {
+    float currentPosition = 0.0f;
+    float targetPosition = 0.0f;
+    bool triggerState = false;
+    bool lastTriggerHigh = false;
+    uint8_t lastMidiValue = 0;
+    float smoothedGainA = 1.0f;
+    float smoothedGainB = 0.0f;
+};
+
+/* ───── specifications ───── */
+static const _NT_specification gSpecs[] = {
+    {
+        .name = "Groups",
+        .min = 1,
+        .max = MAX_GROUPS,
+        .def = 1,
+        .type = kNT_typeGeneric
+    }
+};
+static_assert(NUM_SPECS == sizeof(gSpecs) / sizeof(gSpecs[0]), "Spec count mismatch");
+
+/* ───── instance ───── */
+struct SwitchingMixer : _NT_algorithm {
+    // Configuration
+    uint8_t numGroups;
+
+    // Runtime state
+    MixerGroupState groupState[MAX_GROUPS];
+
+    // Parameters
+    uint8_t numParams;
+    _NT_parameter params[MAX_PARAMS];
+
+    // Parameter pages
+    uint8_t pageIndices[MAX_PARAMS];
+    _NT_parameterPage pageDefs[MAX_GROUPS + 1]; // Global + per-group
+    _NT_parameterPages pages;
+
+    SwitchingMixer() : numGroups(1), numParams(0), pages{} {}
+};
+
+/* ───── helpers ───── */
+static inline float* bus(float* b, int bus_idx, int N) {
+    return (bus_idx > 0) ? (b + (bus_idx - 1) * N) : nullptr;
+}
+
+
+static inline void setParam(_NT_parameter& p, const char* name,
+                            int16_t min, int16_t max, int16_t def, uint8_t unit) {
+    p.name = name;
+    p.min = min;
+    p.max = max;
+    p.def = def;
+    p.unit = unit;
+    p.scaling = 0;
+    p.enumStrings = nullptr;
+}
+
+static inline void setParamEnum(_NT_parameter& p, const char* name,
+                                int16_t min, int16_t max, int16_t def,
+                                const char* const* strings) {
+    p.name = name;
+    p.min = min;
+    p.max = max;
+    p.def = def;
+    p.unit = kNT_unitEnum;
+    p.scaling = 0;
+    p.enumStrings = strings;
+}
+
+static inline float dbToGain(float db) {
+    return std::pow(10.0f, db / 20.0f);
+}
+
+/* ───── requirements ───── */
+static void calcReq(_NT_algorithmRequirements& r, const int32_t* sp) {
+    const int groups = sp[SPEC_GROUPS];
+    
+    r.numParameters = GLOBAL_PARAM_COUNT + (groups * PARAMS_PER_GROUP);
+    r.sram = sizeof(SwitchingMixer);
+    r.dram = 0;
+    r.dtc = 0;
+    r.itc = 0;
+}
+
+/* ───── constructor ───── */
+static _NT_algorithm* construct(const _NT_algorithmMemoryPtrs& m,
+                                 const _NT_algorithmRequirements& r,
+                                 const int32_t* sp) {
+    const uint8_t groups = sp[SPEC_GROUPS];
+    
+    if (groups < 1 || groups > MAX_GROUPS) {
+        return nullptr;
+    }
+    
+    SwitchingMixer* self = new (m.sram) SwitchingMixer();
+    self->numGroups = groups;
+    
+    int p = 0;
+    
+    // --- Global parameters ---
+    setParamEnum(self->params[p++], "Bypass", 0, 1, 0, nullptr);
+    setParam(self->params[p++], "Global Slew", 0, 5000, 10, kNT_unitMs);
+    
+    // --- Per-group parameters ---
+    for (int g = 0; g < groups; ++g) {
+        const int baseInput = 1 + (g * 3);
+        const int baseOutput = 13 + (g * 2);
+        
+        // Input A L/R
+        setParam(self->params[p++], "Input A L", 0, MAX_BUSSES, 
+                 std::min(baseInput, 12), kNT_unitAudioInput);
+        setParam(self->params[p++], "Input A R", 0, MAX_BUSSES, 
+                 0, kNT_unitAudioInput);
+        
+        // Input B L/R
+        setParam(self->params[p++], "Input B L", 0, MAX_BUSSES, 
+                 std::min(baseInput + 1, 12), kNT_unitAudioInput);
+        setParam(self->params[p++], "Input B R", 0, MAX_BUSSES, 
+                 0, kNT_unitAudioInput);
+        
+        // Control input
+        setParam(self->params[p++], "Control", 0, MAX_BUSSES, 
+                 std::min(baseInput + 2, 12), kNT_unitCvInput);
+        
+        // Volumes (in 0.1 dB steps, -400 to +60 = -40.0 to +6.0 dB)
+        setParam(self->params[p++], "Volume A", -400, 60, 0, kNT_unitDb);
+        setParam(self->params[p++], "Volume B", -400, 60, 0, kNT_unitDb);
+        
+        // Control type
+        setParamEnum(self->params[p++], "Ctrl Type", 0, CTRL_TYPE_COUNT - 1, 
+                     CTRL_UNIPOLAR, controlTypeStrings);
+        
+        // Curve
+        setParamEnum(self->params[p++], "Curve", 0, CURVE_COUNT - 1, 
+                     CURVE_EQUAL_POWER, curveStrings);
+        
+        // Slew (ms)
+        setParam(self->params[p++], "Slew", 0, 5000, 10, kNT_unitMs);
+        
+        // MIDI
+        setParamEnum(self->params[p++], "MIDI Enable", 0, 1, 0, nullptr);
+        setParam(self->params[p++], "MIDI Channel", 1, 16, 1, kNT_unitNone);
+        setParam(self->params[p++], "MIDI CC", 0, 127, g, kNT_unitNone);
+        
+        // Destination count
+        setParam(self->params[p++], "Dest Count", 1, MAX_DESTINATIONS, 1, kNT_unitNone);
+        
+        // Destinations (4 pairs)
+        setParam(self->params[p++], "Dest 1 L", 0, MAX_BUSSES, baseOutput, kNT_unitAudioOutput);
+        setParam(self->params[p++], "Dest 1 R", 0, MAX_BUSSES, baseOutput + 1, kNT_unitAudioOutput);
+        setParam(self->params[p++], "Dest 2 L", 0, MAX_BUSSES, 0, kNT_unitAudioOutput);
+        setParam(self->params[p++], "Dest 2 R", 0, MAX_BUSSES, 0, kNT_unitAudioOutput);
+        setParam(self->params[p++], "Dest 3 L", 0, MAX_BUSSES, 0, kNT_unitAudioOutput);
+        setParam(self->params[p++], "Dest 3 R", 0, MAX_BUSSES, 0, kNT_unitAudioOutput);
+        setParam(self->params[p++], "Dest 4 L", 0, MAX_BUSSES, 0, kNT_unitAudioOutput);
+        setParam(self->params[p++], "Dest 4 R", 0, MAX_BUSSES, 0, kNT_unitAudioOutput);
+    }
+    
+    self->numParams = p;
+    
+    // --- Build parameter pages ---
+    int pageIdx = 0;
+    int paramIdx = 0;
+    
+    // Global page
+    self->pageIndices[paramIdx++] = PARAM_BYPASS;
+    self->pageIndices[paramIdx++] = PARAM_GLOBAL_SLEW;
+    self->pageDefs[pageIdx++] = {
+        .name = "Global",
+        .numParams = GLOBAL_PARAM_COUNT,
+        .params = self->pageIndices
+    };
+    
+    // Per-group pages
+    for (int g = 0; g < groups; ++g) {
+        const int groupBase = GLOBAL_PARAM_COUNT + (g * PARAMS_PER_GROUP);
+        uint8_t* pageStart = &self->pageIndices[paramIdx];
+        
+        for (int i = 0; i < PARAMS_PER_GROUP; ++i) {
+            self->pageIndices[paramIdx++] = groupBase + i;
+        }
+        
+        static const char* groupNames[] = {"Group 1", "Group 2", "Group 3", "Group 4"};
+        self->pageDefs[pageIdx++] = {
+            .name = groupNames[g],
+            .numParams = PARAMS_PER_GROUP,
+            .params = pageStart
+        };
+    }
+    
+    self->pages = {
+        .numPages = (uint8_t)(1 + groups),
+        .pages = self->pageDefs
+    };
+    
+    self->parameters = self->params;
+    self->parameterPages = &self->pages;
+    
+    // Initialize group states
+    for (int g = 0; g < MAX_GROUPS; ++g) {
+        self->groupState[g] = MixerGroupState{};
+    }
+    
+    return self;
+}
+
+/* ───── control processing ───── */
+static float processControl(float cv, ControlType type, MixerGroupState& state) {
+    float position = 0.0f;
+    
+    switch (type) {
+        case CTRL_UNIPOLAR:
+            position = std::clamp(cv / 10.0f, 0.0f, 1.0f);
+            break;
+        case CTRL_BIPOLAR:
+            position = std::clamp((cv + 5.0f) / 10.0f, 0.0f, 1.0f);
+            break;
+        case CTRL_UNI_REV:
+            position = 1.0f - std::clamp(cv / 10.0f, 0.0f, 1.0f);
+            break;
+        case CTRL_BI_REV:
+            position = 1.0f - std::clamp((cv + 5.0f) / 10.0f, 0.0f, 1.0f);
+            break;
+        case CTRL_TRIGGER:
+        case CTRL_TRIG_REV: {
+            bool high = (cv > TRIGGER_THRESHOLD);
+            if (high && !state.lastTriggerHigh) {
+                state.triggerState = !state.triggerState;
+            }
+            state.lastTriggerHigh = high;
+            position = (type == CTRL_TRIGGER) 
+                ? (state.triggerState ? 1.0f : 0.0f)
+                : (state.triggerState ? 0.0f : 1.0f);
+            break;
+        }
+        case CTRL_GATE:
+            position = (cv > GATE_THRESHOLD) ? 1.0f : 0.0f;
+            break;
+        case CTRL_GATE_REV:
+            position = (cv > GATE_THRESHOLD) ? 0.0f : 1.0f;
+            break;
+        default:
+            break;
+    }
+    
+    return position;
+}
+
+/* ───── gain calculation ───── */
+static void calculateGains(float position, CrossfadeCurve curve, float& gainA, float& gainB) {
+    switch (curve) {
+        case CURVE_LINEAR:
+            gainA = 1.0f - position;
+            gainB = position;
+            break;
+        case CURVE_EQUAL_POWER:
+            gainA = std::cos(position * 3.14159265f * 0.5f);
+            gainB = std::sin(position * 3.14159265f * 0.5f);
+            break;
+        case CURVE_S_CURVE: {
+            float t = position * position * (3.0f - 2.0f * position);
+            gainA = 1.0f - t;
+            gainB = t;
+            break;
+        }
+        default:
+            gainA = 1.0f - position;
+            gainB = position;
+            break;
+    }
+}
+
+/* ───── DSP step ───── */
+static void step(_NT_algorithm* b, float* buf, int nBy4) {
+    SwitchingMixer* self = static_cast<SwitchingMixer*>(b);
+    const int N = nBy4 * 4;
+    
+    // Check bypass
+    if (self->v[PARAM_BYPASS]) {
+        return;
+    }
+    
+    const float globalSlewMs = self->v[PARAM_GLOBAL_SLEW] * 0.001f; // Convert to seconds
+    const float sampleRate = (float)NT_globals.sampleRate;
+    
+    for (int g = 0; g < self->numGroups; ++g) {
+        const int base = GLOBAL_PARAM_COUNT + (g * PARAMS_PER_GROUP);
+        MixerGroupState& state = self->groupState[g];
+        
+        // Get parameters
+        const int inputA_L = self->v[base + GP_INPUT_A_L];
+        const int inputA_R = self->v[base + GP_INPUT_A_R];
+        const int inputB_L = self->v[base + GP_INPUT_B_L];
+        const int inputB_R = self->v[base + GP_INPUT_B_R];
+        const int controlBus = self->v[base + GP_CONTROL];
+        const float volumeA = dbToGain(self->v[base + GP_VOLUME_A] * 0.1f);
+        const float volumeB = dbToGain(self->v[base + GP_VOLUME_B] * 0.1f);
+        const ControlType ctrlType = (ControlType)std::clamp(
+            (int)self->v[base + GP_CTRL_TYPE], 0, (int)CTRL_TYPE_COUNT - 1);
+        const CrossfadeCurve curve = (CrossfadeCurve)std::clamp(
+            (int)self->v[base + GP_CURVE], 0, (int)CURVE_COUNT - 1);
+        const float slewMs = self->v[base + GP_SLEW] * 0.001f;
+        const int destCount = self->v[base + GP_DEST_COUNT];
+        
+        // Get bus pointers
+        float* inA_L = bus(buf, inputA_L, N);
+        float* inA_R = bus(buf, inputA_R, N);
+        float* inB_L = bus(buf, inputB_L, N);
+        float* inB_R = bus(buf, inputB_R, N);
+        float* ctrl = bus(buf, controlBus, N);
+        
+        // Process control -> target position (read last sample for better response)
+        if (ctrl) {
+            state.targetPosition = processControl(ctrl[N - 1], ctrlType, state);
+        }
+
+        // Calculate slew rate per sample
+        // Use per-group slew if >= 0, otherwise use global (allows 0 for instant switching)
+        float slewTime = (slewMs >= 0.0f) ? slewMs : globalSlewMs;
+        float slewRate;
+        if (slewTime <= 0.0001f) {
+            slewRate = 1.0f; // Instant
+        } else {
+            slewRate = 1.0f - std::exp(-1.0f / (sampleRate * slewTime));
+        }
+
+        // Calculate per-sample smoothing coefficient (~5ms time constant for anti-zipper)
+        const float smoothingTau = 0.005f;
+        const float smoothCoeff = std::exp(-1.0f / (sampleRate * smoothingTau));
+        const float smoothCoeffInv = 1.0f - smoothCoeff;
+
+        // Get destination pointers
+        float* dest[MAX_DESTINATIONS][2];
+        for (int d = 0; d < destCount; ++d) {
+            dest[d][0] = bus(buf, self->v[base + GP_DEST1_L + d * 2], N);
+            dest[d][1] = bus(buf, self->v[base + GP_DEST1_R + d * 2], N);
+        }
+
+        // Process audio with per-sample smoothing
+        for (int n = 0; n < N; ++n) {
+            // Apply slew to position
+            state.currentPosition += (state.targetPosition - state.currentPosition) * slewRate;
+
+            // Calculate crossfade gains
+            float gainA, gainB;
+            calculateGains(state.currentPosition, curve, gainA, gainB);
+            gainA *= volumeA;
+            gainB *= volumeB;
+
+            // Per-sample gain smoothing to avoid zipper noise
+            state.smoothedGainA = state.smoothedGainA * smoothCoeff + gainA * smoothCoeffInv;
+            state.smoothedGainB = state.smoothedGainB * smoothCoeff + gainB * smoothCoeffInv;
+
+            float aL = inA_L ? inA_L[n] : 0.0f;
+            float aR = inA_R ? inA_R[n] : aL;
+            float bL = inB_L ? inB_L[n] : 0.0f;
+            float bR = inB_R ? inB_R[n] : bL;
+
+            float outL = aL * state.smoothedGainA + bL * state.smoothedGainB;
+            float outR = aR * state.smoothedGainA + bR * state.smoothedGainB;
+
+            // Write to destinations (additive)
+            for (int d = 0; d < destCount; ++d) {
+                if (dest[d][0]) dest[d][0][n] += outL;
+                if (dest[d][1]) dest[d][1][n] += outR;
+            }
+        }
+    }
+}
+
+/* ───── MIDI handling ───── */
+static void midiMessage(_NT_algorithm* b, uint8_t byte0, uint8_t byte1, uint8_t byte2) {
+    SwitchingMixer* self = static_cast<SwitchingMixer*>(b);
+
+    const uint8_t status = byte0 & 0xF0;
+    const uint8_t channel = (byte0 & 0x0F) + 1;
+
+    if (status != 0xB0) return; // Only handle CC
+
+    for (int g = 0; g < self->numGroups; ++g) {
+        const int base = GLOBAL_PARAM_COUNT + (g * PARAMS_PER_GROUP);
+
+        if (!self->v[base + GP_MIDI_ENABLE]) continue;
+        if (channel != self->v[base + GP_MIDI_CHANNEL]) continue;
+        if (byte1 != self->v[base + GP_MIDI_CC]) continue;
+
+        MixerGroupState& state = self->groupState[g];
+        const ControlType ctrlType = (ControlType)std::clamp(
+            (int)self->v[base + GP_CTRL_TYPE], 0, (int)CTRL_TYPE_COUNT - 1);
+        float position = byte2 / 127.0f;
+
+        switch (ctrlType) {
+            case CTRL_UNI_REV:
+            case CTRL_BI_REV:
+                position = 1.0f - position;
+                break;
+            case CTRL_TRIGGER:
+            case CTRL_TRIG_REV: {
+                // Only toggle on rising edge (low->high transition)
+                bool wasHigh = state.lastMidiValue > 63;
+                bool isHigh = byte2 > 63;
+                if (isHigh && !wasHigh) {
+                    state.triggerState = !state.triggerState;
+                }
+                position = (ctrlType == CTRL_TRIGGER)
+                    ? (state.triggerState ? 1.0f : 0.0f)
+                    : (state.triggerState ? 0.0f : 1.0f);
+                break;
+            }
+            case CTRL_GATE:
+                position = (byte2 > 63) ? 1.0f : 0.0f;
+                break;
+            case CTRL_GATE_REV:
+                position = (byte2 > 63) ? 0.0f : 1.0f;
+                break;
+            default:
+                break;
+        }
+
+        state.lastMidiValue = byte2;
+        state.targetPosition = position;
+    }
+}
+
+/* ───── parameter UI prefix ───── */
+static int parameterUiPrefix(_NT_algorithm* self, int p, char* buff) {
+    // Global parameters (indices 0 and 1) get no prefix
+    if (p < GLOBAL_PARAM_COUNT) {
+        return 0;
+    }
+
+    // Per-group parameters get "N:" prefix
+    int groupIndex = (p - GLOBAL_PARAM_COUNT) / PARAMS_PER_GROUP;
+    int len = NT_intToString(buff, 1 + groupIndex);
+    buff[len++] = ':';
+    buff[len] = '\0';
+    return len;
+}
+
+/* ───── factory & entry ───── */
+static const _NT_factory gFactory = {
+    .guid = NT_MULTICHAR('S', 'w', 'M', 'x'),
+    .name = "Switching Mixer",
+    .description = "Crossfade/switch mixer with 1-4 groups. Each group: A/B inputs, "
+                   "CV/MIDI control, multiple curve types, up to 4 destinations.",
+    .numSpecifications = sizeof(gSpecs) / sizeof(gSpecs[0]),
+    .specifications = gSpecs,
+    .calculateStaticRequirements = nullptr,
+    .initialise = nullptr,
+    .calculateRequirements = calcReq,
+    .construct = construct,
+    .parameterChanged = nullptr,
+    .step = step,
+    .draw = nullptr,
+    .midiRealtime = nullptr,
+    .midiMessage = midiMessage,
+    .tags = kNT_tagUtility,
+    .hasCustomUi = nullptr,
+    .customUi = nullptr,
+    .setupUi = nullptr,
+    .parameterUiPrefix = parameterUiPrefix
+};
+
+extern "C" uintptr_t pluginEntry(_NT_selector s, uint32_t i) {
+    switch (s) {
+        case kNT_selector_version:
+            return kNT_apiVersionCurrent;
+        case kNT_selector_numFactories:
+            return 1;
+        case kNT_selector_factoryInfo:
+            return (i == 0) ? reinterpret_cast<uintptr_t>(&gFactory) : 0;
+        default:
+            return 0;
+    }
+}
