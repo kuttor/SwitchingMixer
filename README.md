@@ -46,7 +46,7 @@ Control ──►│      (Group N)      ├──► Dest 2 L/R
 | Volume B     | -40 to +6 dB| 0 dB       | Input B volume                 |
 | Ctrl Type    | Enum        | Unipolar   | Control response type          |
 | Curve        | Enum        | Equal Power| Crossfade curve                |
-| Slew         | 0-5000 ms   | 10 ms      | Per-group slew time            |
+| Crossfade    | 0-10        | 0          | Per-group slew time            |
 | MIDI Enable  | Off/On      | Off        | Enable MIDI control            |
 | MIDI Channel | 1-16        | 1          | MIDI channel                   |
 | MIDI CC      | 0-127       | Group #    | MIDI CC number                 |
